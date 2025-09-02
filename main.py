@@ -1,96 +1,94 @@
 import os
 import logging
-import requests
+import aiohttp
 from telegram import Update
 from telegram.ext import ApplicationBuilder, MessageHandler, ContextTypes, filters
 
-# Logging setup
+# Enable logging
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO
 )
 logger = logging.getLogger(_name_)
 
-# Environment variables
-BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+# Load environment variables
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 VT_API_KEY = os.getenv("VT_API_KEY")
-MAX_FILE_MB = int(os.getenv("MAX_FILE_MB", "32"))
+MAX_FILE_MB = int(os.getenv("MAX_FILE_MB", 32))  # Default: 32MB
 DELETE_BAD = os.getenv("DELETE_BAD", "1") == "1"
 
-VT_API_URL = "https://www.virustotal.com/api/v3/files"
+# VirusTotal API URL
+VT_URL = "https://www.virustotal.com/api/v3/files"
 
-async def scan_file(file_path: str):
-    """Upload file to VirusTotal and fetch result."""
-    headers = {"x-apikey": VT_API_KEY}
-    files = {"file": open(file_path, "rb")}
+# Scan uploaded documents
+async def scan_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message.document:
+        return
+
+    file_info = await context.bot.get_file(update.message.document.file_id)
+
+    # Check file size
+    file_size = update.message.document.file_size / (1024 * 1024)
+    if file_size > MAX_FILE_MB:
+        await update.message.reply_text(
+            f"⚠ File too large! Max size is {MAX_FILE_MB}MB."
+        )
+        return
+
+    # Download file
+    file_path = f"temp_{update.message.document.file_name}"
+    await file_info.download_to_drive(file_path)
 
     try:
-        response = requests.post(VT_API_URL, headers=headers, files=files)
-        files["file"].close()
+        # Upload file to VirusTotal
+        async with aiohttp.ClientSession() as session:
+            headers = {"x-apikey": VT_API_KEY}
+            with open(file_path, "rb") as f:
+                data = aiohttp.FormData()
+                data.add_field("file", f, filename=update.message.document.file_name)
+                async with session.post(VT_URL, headers=headers, data=data) as response:
+                    vt_result = await response.json()
 
-        if response.status_code != 200:
-            return {"error": f"VirusTotal API Error: {response.status_code}"}
-
-        data_id = response.json()["data"]["id"]
-        result_url = f"{VT_API_URL}/{data_id}"
-
-        # Poll until scan completes
-        while True:
-            res = requests.get(result_url, headers=headers)
-            result = res.json()
-            status = result["data"]["attributes"]["status"]
-            if status == "completed":
-                return result
-    except Exception as e:
-        return {"error": str(e)}
-
-async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle uploaded files and scan them."""
-    try:
-        file = await update.message.document.get_file()
-        file_size = update.message.document.file_size / (1024 * 1024)
-
-        if file_size > MAX_FILE_MB:
-            await update.message.reply_text(f"⚠ File too large! Max: {MAX_FILE_MB}MB")
+        # Parse result
+        analysis_id = vt_result.get("data", {}).get("id")
+        if not analysis_id:
+            await update.message.reply_text("❌ Error scanning file.")
             return
 
-        file_path = f"/tmp/{update.message.document.file_name}"
-        await file.download_to_drive(file_path)
+        # Fetch analysis report
+        report_url = f"https://www.virustotal.com/api/v3/analyses/{analysis_id}"
+        async with aiohttp.ClientSession() as session:
+            headers = {"x-apikey": VT_API_KEY}
+            async with session.get(report_url, headers=headers) as response:
+                report = await response.json()
 
-        await update.message.reply_text("🔍 Scanning your file via VirusTotal...")
-        result = await scan_file(file_path)
+        stats = report.get("data", {}).get("attributes", {}).get("stats", {})
+        malicious = stats.get("malicious", 0)
+        suspicious = stats.get("suspicious", 0)
 
-        if "error" in result:
-            await update.message.reply_text(f"❌ Error: {result['error']}")
-            os.remove(file_path)
-            return
+        # Send scan result
+        if malicious > 0 or suspicious > 0:
+            msg = f"🚨 Threats Detected!\nMalicious: {malicious}\nSuspicious: {suspicious}"
+            await update.message.reply_markdown(msg)
 
-        stats = result["data"]["attributes"]["last_analysis_stats"]
-        malicious = stats["malicious"]
-
-        if malicious > 0:
-            await update.message.reply_text(f"🚨 {malicious} threats detected!")
+            # Optionally delete infected files
             if DELETE_BAD:
-                try:
-                    await update.message.delete()
-                except Exception:
-                    pass
+                await update.message.delete()
         else:
-            await update.message.reply_text("✅ File is clean and safe.")
+            await update.message.reply_text("✅ File is safe.")
 
-        os.remove(file_path)
     except Exception as e:
-        logger.error(f"Error in handle_file: {e}")
-        await update.message.reply_text("⚠ Unexpected error while scanning.")
+        logger.error(f"Error scanning file: {e}")
+        await update.message.reply_text("⚠ An error occurred while scanning.")
+    finally:
+        # Remove temporary file
+        if os.path.exists(file_path):
+            os.remove(file_path)
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("🤖 Send me any file, I'll scan it using VirusTotal.")
-
+# Main function to start bot
 def main():
-    app = ApplicationBuilder().token(BOT_TOKEN).build()
-    app.add_handler(MessageHandler(filters.Document.ALL, handle_file))
-    app.add_handler(MessageHandler(filters.TEXT & filters.Regex("^/start$"), start))
-    logger.info("Bot started successfully.")
+    app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
+    app.add_handler(MessageHandler(filters.Document.ALL, scan_document))
     app.run_polling()
 
 if _name_ == "_main_":
